@@ -2,70 +2,120 @@
 
 set -e
 
-if ! command -v uuidgen >/dev/null 2>&1; then
-  echo "uuidgen is not installed"
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root"
   exit 1
 fi
 
-read -p "Enter domain: " DOMAIN
+read -p "Enter domain (example: xray.example.com): " DOMAIN
 read -p "Enter email: " EMAIL
-read -p "Enter path: " PATH_NAME
+read -p "Enter port (example: 2096): " PORT
+read -p "Enter path (example: mypath): " PATH_NAME
 
-UUID=$(uuidgen)
+# remove leading/trailing slashes
+PATH_NAME=$(echo "$PATH_NAME" | sed 's#^/*##; s#/*$##')
+PORT=${PORT:-2096}
 
-XRAY_DIR="/usr/local/etc/xray"
-CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+echo "[1/10] Updating system..."
 
-echo "[1/5] Installing nginx and certbot..."
-apt update
-apt install -y nginx certbot python3-certbot-nginx curl socat
+apt update && apt upgrade -y
 
-echo "[2/5] Configuring nginx..."
+echo "[2/10] Installing packages..."
 
-cat > /etc/nginx/sites-available/$DOMAIN <<EOF
-server {
-    listen 80;
-    server_name $DOMAIN;
+apt install -y curl socat cron ufw
 
-    location / {
-        return 200 'ok';
-    }
-}
-EOF
+echo "[3/10] Installing Xray..."
 
-ln -sf /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/$DOMAIN
+bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
-nginx -t
-systemctl restart nginx
+echo "[4/10] Checking Xray version..."
 
-echo "[3/5] Requesting SSL certificate..."
+xray version
 
-certbot certonly \
-  --nginx \
-  --agree-tos \
-  --no-eff-email \
-  --email "$EMAIL" \
+UUID=$(xray uuid)
+
+echo ""
+echo "Generated UUID:"
+echo "$UUID"
+echo ""
+
+echo "[5/10] Enabling Xray service..."
+
+systemctl enable xray
+
+echo "[6/10] Configuring firewall..."
+
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw allow 443/tcp
+ufw allow ${PORT}/tcp
+
+ufw --force enable
+
+echo "[7/10] Installing acme.sh..."
+
+curl https://get.acme.sh | sh -s email="$EMAIL"
+
+export PATH="$HOME/.acme.sh:$PATH"
+
+~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
+
+echo "[8/10] Stopping services using port 80..."
+
+systemctl stop apache2 2>/dev/null || true
+systemctl disable apache2 2>/dev/null || true
+
+systemctl stop nginx 2>/dev/null || true
+
+echo "[9/10] Issuing TLS certificate..."
+
+~/.acme.sh/acme.sh --issue \
   -d "$DOMAIN" \
-  --non-interactive
+  --standalone \
+  -k ec-256
 
-echo "[4/5] Creating Xray configuration..."
+mkdir -p /etc/xray
 
-mkdir -p $XRAY_DIR
+~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --ecc \
+  --fullchain-file /etc/xray/cert.pem \
+  --key-file /etc/xray/key.pem \
+  --reloadcmd "systemctl restart xray"
 
-cat > $XRAY_DIR/config.json <<EOF
+chown -R nobody:nogroup /etc/xray
+
+chmod 644 /etc/xray/cert.pem
+chmod 640 /etc/xray/key.pem
+
+echo "[10/10] Creating Xray configuration..."
+
+mkdir -p /var/log/xray
+
+touch /var/log/xray/access.log
+touch /var/log/xray/error.log
+
+chown -R nobody:nogroup /var/log/xray
+
+cp /usr/local/etc/xray/config.json \
+   /usr/local/etc/xray/config.json.bak 2>/dev/null || true
+
+cat > /usr/local/etc/xray/config.json <<EOF
 {
   "log": {
-    "loglevel": "warning"
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log"
   },
   "inbounds": [
     {
+      "tag": "xhttp-in",
       "listen": "0.0.0.0",
-      "port": 443,
+      "port": $PORT,
       "protocol": "vless",
       "settings": {
         "clients": [
           {
-            "id": "$UUID"
+            "id": "$UUID",
+            "flow": ""
           }
         ],
         "decryption": "none"
@@ -74,36 +124,78 @@ cat > $XRAY_DIR/config.json <<EOF
         "network": "xhttp",
         "security": "tls",
         "tlsSettings": {
-          "serverName": "$DOMAIN",
+          "alpn": [
+            "h2",
+            "http/1.1"
+          ],
           "certificates": [
             {
-              "certificateFile": "$CERT_DIR/fullchain.pem",
-              "keyFile": "$CERT_DIR/privkey.pem"
+              "certificateFile": "/etc/xray/cert.pem",
+              "keyFile": "/etc/xray/key.pem"
             }
           ]
         },
         "xhttpSettings": {
-          "path": "/$PATH_NAME"
+          "path": "/$PATH_NAME",
+          "host": "$DOMAIN",
+          "mode": "auto"
         }
       }
     }
   ],
   "outbounds": [
     {
-      "protocol": "freedom"
+      "protocol": "freedom",
+      "tag": "direct"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "blocked"
     }
   ]
 }
 EOF
 
-echo "[5/5] Restarting Xray..."
+echo ""
+echo "Testing Xray configuration..."
+echo ""
 
-systemctl restart xray || true
-systemctl enable xray || true
+xray -test -config /usr/local/etc/xray/config.json
+
+echo ""
+echo "Restarting Xray..."
+echo ""
+
+systemctl restart xray
+
+echo ""
+echo "Waiting for Xray port..."
+echo ""
+
+until ss -tln | grep -q ":$PORT "; do
+  sleep 1
+done
+
+echo ""
+echo "Checking listening port..."
+echo ""
+
+ss -tlnp | grep "$PORT" || true
+
+echo ""
+echo "Local connectivity test..."
+echo ""
+
+curl -vk "https://127.0.0.1:$PORT/$PATH_NAME" || true
 
 echo ""
 echo "======================================"
-echo "UUID: $UUID"
-echo "DOMAIN: $DOMAIN"
-echo "PATH: /$PATH_NAME"
+echo "DOMAIN : $DOMAIN"
+echo "PORT   : $PORT"
+echo "UUID   : $UUID"
+echo "PATH   : /$PATH_NAME"
+echo ""
+echo "VLESS URL:"
+echo ""
+echo "vless://$UUID@$DOMAIN:$PORT?security=tls&type=xhttp&path=%2F$PATH_NAME&host=$DOMAIN&sni=$DOMAIN#$DOMAIN"
 echo "======================================"
